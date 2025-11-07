@@ -1,1 +1,7 @@
-rm -rf .gitrm -rf .git
+__pycache__/
+*.pyc
+instance/
+.env
+ca.pem
+output/
+uploads/

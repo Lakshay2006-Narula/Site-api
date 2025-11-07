@@ -2,39 +2,33 @@ import os
 import requests
 import io
 import csv
+import re
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.dialects.mysql import (
     BIGINT, DATETIME, FLOAT, INTEGER, VARCHAR, TEXT
 )
 from dotenv import load_dotenv
+
 load_dotenv()
-# --- Configuration ---
 
 app = Flask(__name__)
 
-# 1. ML API Configuration
+BASE_DIR = os.path.dirname(__file__)
+OUTPUT_FOLDER = os.path.join(BASE_DIR, 'output')
+
+# ML API URL (this API decides ML or NoML automatically)
 ML_API_URL = os.getenv("API_URL")
 
-# 2. Database Configuration
+# Database config
 db_uri = os.getenv("DATABASE_URL")
 app.config['SQLALCHEMY_DATABASE_URI'] = db_uri
 
-# SSL Configuration for Aiven
-ca_pem_path = os.path.join(os.path.dirname(__file__), 'ca.pem')
-
-if not os.path.exists(ca_pem_path):
-    print("-------------------------------------------------------")
-    print(f"ERROR: ca.pem file not found at: {ca_pem_path}")
-    print("Please download ca.pem from your Aiven dashboard")
-    print("and place it in the same directory as app.py")
-    print("-------------------------------------------------------")
-    
+# SSL config for Aiven
+ca_pem_path = os.path.join(BASE_DIR, 'ca.pem')
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'connect_args': {
-        'ssl': {
-            'ca': ca_pem_path
-        }
+        'ssl': {'ca': ca_pem_path}
     }
 }
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -42,7 +36,6 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
 # --- Database Model ---
-# This class is an exact match for your table schema
 class NetworkLog(db.Model):
     __tablename__ = 'tbl_network_log'
     
@@ -51,190 +44,125 @@ class NetworkLog(db.Model):
     timestamp = db.Column(DATETIME, index=True)
     lat = db.Column(FLOAT(precision=10, scale=6))
     lon = db.Column(FLOAT(precision=10, scale=6))
-    altitude = db.Column(db.Float)
-    indoor_outdoor = db.Column(VARCHAR(45))
-    phone_heading = db.Column(db.Float)
-    battery = db.Column(db.Integer)
-    dls = db.Column(VARCHAR(50))
-    uls = db.Column(VARCHAR(50))
-    call_state = db.Column(VARCHAR(50))
-    hotspot = db.Column(VARCHAR(512))
-    apps = db.Column(VARCHAR(512))
-    num_cells = db.Column(db.Integer)
-    network = db.Column(VARCHAR(45), index=True)
-    m_mcc = db.Column(db.Integer)
-    m_mnc = db.Column(db.Integer)
+    band = db.Column(VARCHAR(64), index=True)
     m_alpha_long = db.Column(VARCHAR(45), index=True)
-    m_alpha_short = db.Column(VARCHAR(45))
-    mci = db.Column(VARCHAR(45))
-    pci = db.Column(VARCHAR(45))
-    tac = db.Column(VARCHAR(45))
+    network = db.Column(VARCHAR(45), index=True)
     earfcn = db.Column(VARCHAR(45))
-    rssi = db.Column(FLOAT(precision=5, scale=2))
+    pci = db.Column(VARCHAR(45))
     rsrp = db.Column(FLOAT(precision=5, scale=2))
     rsrq = db.Column(FLOAT(precision=5, scale=2))
     sinr = db.Column(FLOAT(precision=5, scale=2))
-    total_rx_kb = db.Column(VARCHAR(45))
-    total_tx_kb = db.Column(VARCHAR(45))
-    mos = db.Column(db.Float)
-    jitter = db.Column(db.Float)
-    latency = db.Column(db.Float)
-    packet_loss = db.Column(db.Float)
-    dl_tpt = db.Column(VARCHAR(45))
-    ul_tpt = db.Column(VARCHAR(45))
-    volte_call = db.Column(VARCHAR(45))
-    band = db.Column(VARCHAR(64), index=True)
-    cqi = db.Column(db.Float)
-    bler = db.Column(VARCHAR(45))
     primary_cell_info_1 = db.Column(TEXT)
-    primary_cell_info_2 = db.Column(TEXT)
-    all_neigbor_cell_info = db.Column(TEXT)
-    image_path = db.Column(VARCHAR(512))
-    polygon_id = db.Column(db.Integer, index=True)
-    primary_cell_info_3 = db.Column(TEXT)
-    speed = db.Column(db.Float)
     ta = db.Column(VARCHAR(128))
-    mcc = db.Column(db.Integer)
-    mnc = db.Column(db.Integer)
-    gps_fix_type = db.Column(VARCHAR(128))
-    gps_hdop = db.Column(db.Float)
-    gps_vdop = db.Column(db.Float)
-    phone_antenna_gain = db.Column(VARCHAR(128))
-    csi_rsrp = db.Column(db.Float)
-    csi_rsrq = db.Column(db.Float)
-    csi_sinr = db.Column(db.Float)
-    level = db.Column(db.Integer)
-    cell_id = db.Column(VARCHAR(128))
-    nodeb_id = db.Column(VARCHAR(128))
-    primary = db.Column(VARCHAR(128))
 
 
-# CSV Header from your sample file
+# CSV Header
 CSV_HEADER = [
     'timestamp_utc', 'lat', 'lon', 'network', 'technology',
     'earfcn_or_narfcn', 'pci_or_psi', 'rsrp_dbm', 'rsrq_db',
     'sinr_db', 'band_mhz', 'cell_id_global', 'ta'
 ]
 
-# --- Helper Functions for Data Cleaning ---
-
-def safe_int(value, default=None):
-    """
-    Tries to convert a value to an integer.
-    Handles None, empty strings, and floats.
-    Returns 'default' (None) on failure.
-    """
-    if value is None or value == '':
-        return default
+def safe_int(value):
     try:
-        # Convert floats to int, then to int
         return int(float(value))
-    except (ValueError, TypeError):
-        return default 
+    except:
+        return None
 
-def safe_float(value, default=None):
-    """
-    Tries to convert a value to a float.
-    Handles None, empty strings.
-    Returns 'default' (None) on failure.
-    """
-    if value is None or value == '':
-        return default
+def safe_float(value):
     try:
         return float(value)
-    except (ValueError, TypeError):
-        return default
+    except:
+        return None
 
-# --- API Endpoint ---
-@app.route('/api/process-and-upload', methods=['POST'])
-def process_and_upload():
+def extract_mci(cell_info_str):
+    if not cell_info_str:
+        return None
+    match = re.search(r'mCi=([0-9*]+)', cell_info_str)
+    return match.group(1) if match else None
+
+
+# --- MAIN API ENDPOINT ---
+@app.route('/api/process-and-save', methods=['POST'])
+def process_and_save():
     data = request.get_json()
-    session_id = data.get('session_id')
-    project_id = data.get('project_id')
 
-    if not session_id or not project_id:
-        return jsonify({"error": "Missing 'session_id' or 'project_id'"}), 400
+    session_ids = data.get('session_ids')
+    project_id_str = data.get('project_id')
 
-    print(f"Processing session: {session_id} for project: {project_id}")
+    if not session_ids or not isinstance(session_ids, list):
+        return jsonify({"error": "session_ids must be a list"}), 400
 
-    try:
-        # 1. Find data in tbl_network_log
-        logs = NetworkLog.query.filter_by(session_id=int(session_id)).all()
+    if not project_id_str:
+        return jsonify({"error": "project_id is required"}), 400
 
-        if not logs:
-            return jsonify({"error": f"No logs found for session_id: {session_id}"}), 404
+    project_id = safe_int(project_id_str)
+    if project_id is None:
+        return jsonify({"error": "Invalid project_id; must be integer"}), 400
 
-        print(f"Found {len(logs)} log entries.")
+    logs = NetworkLog.query.filter(NetworkLog.session_id.in_(session_ids)).all()
+    if not logs:
+        return jsonify({"error": "No logs found for given session_ids"}), 404
 
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    filename = f"project_{project_id}_combined_data.csv"
+    file_path = os.path.join(OUTPUT_FOLDER, filename)
 
-
-        # 2. Create the CSV file in memory
-        output = io.StringIO()
-        writer = csv.writer(output)
+    # Create CSV file
+    with open(file_path, 'w', newline='', encoding='utf-8') as output_file:
+        writer = csv.writer(output_file)
         writer.writerow(CSV_HEADER)
-        
+
         for log in logs:
-            timestamp_str = log.timestamp.isoformat() if log.timestamp else None
-            
-            # This mapping is correct based on your sample file
             writer.writerow([
-                timestamp_str,
+                log.timestamp.isoformat() if log.timestamp else None,
                 safe_float(log.lat),
                 safe_float(log.lon),
-                log.network,              # network/operator (e.g., 'Airtel', 'VI', 'JIO')
-                log.dls or log.uls or log.band or log.network,  # technology fallback (LTE/NR/3G)
+                log.m_alpha_long,
+                log.network,
                 safe_int(log.earfcn),
                 safe_int(log.pci),
-                safe_int(log.rsrp),
-                safe_int(log.rsrq),
-                safe_int(log.sinr),
-                log.band,                 # keep band as TEXT, do NOT convert
-                str(log.mci),             # IMPORTANT: send as string, not int
-                log.ta                    # keep raw TA value
+                safe_float(log.rsrp),
+                safe_float(log.rsrq),
+                safe_float(log.sinr),
+                log.band,
+                extract_mci(log.primary_cell_info_1),
+                log.ta
             ])
 
+    # --- SEND TO ML API ALWAYS ---
+    if not ML_API_URL:
+        return jsonify({"error": "ML_API_URL not configured in .env"}), 500
 
-        
-        csv_data = output.getvalue()
-        output.close()
+    try:
+        with open(file_path, 'rb') as f:
+            response = requests.post(
+                ML_API_URL,
+                files={'file': (filename, f, 'text/csv')},
+                data={'project_id': project_id}
+            )
 
-        # 3. Prepare data to send to ML API
-        payload_data = {
-            'project_id': project_id
-        }
-        
-        payload_files = {
-            'file': (f'{session_id}_data.csv', csv_data, 'text/csv')
-        }
+        response.raise_for_status()
 
-        # 4. Send to ML prediction tool
-        print(f"Forwarding CSV data to ML API...")
-        response = requests.post(ML_API_URL, data=payload_data, files=payload_files)
-        
-        response.raise_for_status() # Error on 4xx/5xx
+        try:
+            ml_api_response = response.json()
+        except:
+            ml_api_response = {"raw_response": response.text}
 
-        # 5. Return the response from the ML tool
+    except requests.exceptions.RequestException as e:
         return jsonify({
-            "status": "success",
-            "message": "Data processed and sent to ML API",
-            "ml_api_response": response.json()
-        }), 200
+            "status": "error",
+            "message": "ML API request failed",
+            "error": str(e)
+        }), 502
 
-    except requests.exceptions.HTTPError as e:
-        # Handle errors from the ML API call
-        print(f"HTTP Error from ML API: {e}")
-        return jsonify({
-            "error": "ML API returned an error", 
-            "details": str(e),
-            "ml_api_response": e.response.text
-        }), e.response.status_code
-        
-    except Exception as e:
-        # Handle other errors
-        print(f"An unexpected error occurred: {e}")
-        db.session.rollback()
-        return jsonify({"error": "An internal server error occurred", "details": str(e)}), 500
+    return jsonify({
+        "status": "success",
+        "file_path": file_path,
+        "ml_api_response": ml_api_response
+    }), 200
 
-# --- Run the App ---
+
+# --- RUN SERVER ---
 if __name__ == '__main__':
-    app.run(debug=True, port=8080)
+    app.run(debug=True, port=8080, host='0.0.0.0')
